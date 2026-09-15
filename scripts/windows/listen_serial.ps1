@@ -13,7 +13,7 @@ $ErrorActionPreference = 'Continue'
 
 . (Join-Path $PSScriptRoot '_paths.ps1')
 $ConfigPs = Join-Path $BuildRoot 'build_config.ps1'
-if (-not (Test-Path $ConfigPs)) { throw "build_config.ps1 not found at $ConfigPs. Run setup_build_environment.ps1 first." }
+if (-not (Test-Path $ConfigPs)) { throw "build_config.ps1 not found at $ConfigPs. Run setup.ps1 first." }
 . $ConfigPs
 
 $PythonBin = Get-Cfg venv_python_bin

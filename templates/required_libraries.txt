@@ -1,3 +1,0 @@
-# One git repository per line, optionally followed by git clone arguments.
-# Cloned into build/libraries/ by setup_build_environment and passed to the compiler.
-# https://github.com/bblanchon/ArduinoJson --branch v7.4.2

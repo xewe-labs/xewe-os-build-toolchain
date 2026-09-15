@@ -1,7 +1,0 @@
-.venv/
-builds/
-libraries/*
-!libraries/required_libraries.txt
-build_config
-build_config.ps1
-version_state

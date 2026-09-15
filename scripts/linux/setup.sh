@@ -1,28 +1,37 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# setup_build_environment.sh — one-time environment setup for this repo.
-# - Checks Homebrew; offers to install if missing
-# - Checks Arduino CLI; offers to install via brew if missing
+# setup.sh — build environment setup for a project whose build/ holds this toolchain.
+# - macOS: uses Homebrew to install dependencies
+# - Linux: uses system package manager where possible; falls back to Arduino CLI install script if needed
+# - Checks Arduino CLI; offers to install if missing
 # - Checks ESP32 Core; offers to install if missing
-# - Checks Python; offers to install (macOS via brew) if missing
+# - Checks Python; offers to install if missing
 # - Creates .venv next to this script
 # - Installs esptool into .venv if missing
-# - Clones Arduino libraries from required_libraries.txt into libraries
+# - Clones Arduino libraries from build/required_libraries.txt into build/libraries (created if missing; removes .git)
+# - Creates version_state and release_matrix.csv if missing
+# - Ensures a project .ino and Config.h exist in the project root
 # - Creates build_config for reuse by build/upload scripts
+# - Updates build/.gitignore with the installed toolchain and generated paths
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../common/paths.sh"
 
 VENV_DIR="${BUILD_ROOT}/.venv"
 LIBRARIES_DIR="${BUILD_ROOT}/libraries"
-REQUIREMENTS_FILE="${LIBRARIES_DIR}/required_libraries.txt"
+REQUIREMENTS_FILE="${BUILD_ROOT}/required_libraries.txt"
 STATE_FILE="${BUILD_ROOT}/version_state"
 RELEASE_MATRIX_FILE="${BUILD_ROOT}/release_matrix.csv"
 BUILD_CONFIG_FILE="${BUILD_ROOT}/build_config"
 
 ESP32_CORE_FQBN="esp32:esp32"
 ESP32_BOARD_MANAGER_URL="https://espressif.github.io/arduino-esp32/package_esp32_index.json"
+
+# Optional override (Linux fallback installer):
+#   export ARDUINO_CLI_VERSION="0.35.3"
+# Default is auto-detected latest (best-effort).
+ARDUINO_CLI_VERSION="${ARDUINO_CLI_VERSION:-}"
 
 confirm() {
   local prompt="${1:-Continue?}"
@@ -36,7 +45,74 @@ confirm() {
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 is_macos() { [[ "$(uname -s)" == "Darwin" ]]; }
+is_linux() { [[ "$(uname -s)" == "Linux" ]]; }
 
+is_root() { [[ "$(id -u)" -eq 0 ]]; }
+
+run_root() {
+  if is_root; then
+    "$@"
+  elif have_cmd sudo; then
+    sudo "$@"
+  else
+    echo "❌ Need root privileges to run: $*" >&2
+    echo "   Re-run as root or install 'sudo'." >&2
+    exit 1
+  fi
+}
+
+ensure_local_bin_on_path() {
+  if is_linux; then
+    mkdir -p "${HOME}/.local/bin"
+    export PATH="${HOME}/.local/bin:${PATH}"
+  fi
+}
+
+detect_pkg_mgr() {
+  if have_cmd apt-get; then echo "apt"
+  elif have_cmd dnf; then echo "dnf"
+  elif have_cmd yum; then echo "yum"
+  elif have_cmd pacman; then echo "pacman"
+  elif have_cmd zypper; then echo "zypper"
+  elif have_cmd apk; then echo "apk"
+  else echo ""
+  fi
+}
+
+# Install packages with the detected package manager (Linux only)
+install_pkgs_linux() {
+  local mgr
+  mgr="$(detect_pkg_mgr)"
+  if [[ -z "${mgr}" ]]; then
+    echo "❌ No supported Linux package manager found (apt/dnf/yum/pacman/zypper/apk)." >&2
+    echo "   Install dependencies manually: git, curl, python3 (+ venv/pip), and re-run." >&2
+    exit 1
+  fi
+
+  case "${mgr}" in
+    apt)
+      run_root apt-get update -y
+      run_root apt-get install -y "$@"
+      ;;
+    dnf)
+      run_root dnf install -y "$@"
+      ;;
+    yum)
+      run_root yum install -y "$@"
+      ;;
+    pacman)
+      run_root pacman -Sy --noconfirm --needed "$@"
+      ;;
+    zypper)
+      run_root zypper --non-interactive install -y "$@"
+      ;;
+    apk)
+      run_root apk add "$@"
+      ;;
+  esac
+}
+
+# ---------------- macOS: Homebrew helpers ----------------
 ensure_brew_shellenv() {
   if [[ -x /opt/homebrew/bin/brew ]]; then
     eval "$(/opt/homebrew/bin/brew shellenv)"
@@ -48,7 +124,7 @@ ensure_brew_shellenv() {
 install_brew() {
   if ! is_macos; then
     echo "❌ Homebrew auto-install is only implemented for macOS in this script." >&2
-    echo "   Install brew manually: https://brew.sh" >&2
+    echo "   On Linux, use your system package manager." >&2
     exit 1
   fi
   echo "➡️  Installing Homebrew..." >&2
@@ -69,8 +145,81 @@ ensure_brew() {
     have_cmd brew || { echo "❌ Homebrew install did not result in 'brew' on PATH." >&2; exit 1; }
     echo "✅ Homebrew installed: $(command -v brew)" >&2
   else
-    echo "❌ Cannot proceed without Homebrew for automated installs." >&2
+    echo "❌ Cannot proceed without Homebrew for automated installs on macOS." >&2
     exit 1
+  fi
+}
+# --------------------------------------------------------
+
+ensure_base_tools_linux() {
+  # This script needs git + curl at minimum (libraries + Arduino CLI fallback install).
+  local missing=()
+  have_cmd git || missing+=("git")
+  have_cmd curl || missing+=("curl")
+
+  if ((${#missing[@]})); then
+    echo "⚠️  Missing tools: ${missing[*]}" >&2
+    if confirm "Install missing tools via system package manager now?"; then
+      case "$(detect_pkg_mgr)" in
+        apt|dnf|yum|pacman|zypper|apk) install_pkgs_linux ca-certificates "${missing[@]}" ;;
+        *) install_pkgs_linux "${missing[@]}" ;;
+      esac
+    else
+      echo "❌ Cannot proceed without: ${missing[*]}" >&2
+      exit 1
+    fi
+  fi
+}
+
+# ---------------- Arduino CLI installation (Linux) ----------------
+get_latest_arduino_cli_version() {
+  # Best-effort. If this fails, returns empty string.
+  # Uses GitHub API; no jq dependency.
+  curl -fsSL https://api.github.com/repos/arduino/arduino-cli/releases/latest \
+    | sed -n 's/.*"tag_name":[[:space:]]*"\(v\{0,1\}[0-9.]\+\)".*/\1/p' \
+    | head -n 1 \
+    | sed 's/^v//'
+}
+
+install_arduino_cli_via_script_linux() {
+  ensure_local_bin_on_path
+
+  local ver="${ARDUINO_CLI_VERSION}"
+  if [[ -z "${ver}" ]]; then
+    ver="$(get_latest_arduino_cli_version || true)"
+  fi
+  if [[ -z "${ver}" ]]; then
+    ver="latest"
+  fi
+
+  local install_dir="/usr/local/bin"
+  if ! is_root; then
+    if [[ -w "${install_dir}" ]]; then
+      :
+    elif have_cmd sudo; then
+      :
+    else
+      install_dir="${HOME}/.local/bin"
+    fi
+  fi
+
+  echo "➡️  Installing Arduino CLI (version: ${ver}) to ${install_dir} ..." >&2
+  mkdir -p "${install_dir}" 2>/dev/null || true
+
+  if [[ "${install_dir}" == "/usr/local/bin" ]]; then
+    if is_root; then
+      curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh \
+        | BINDIR="${install_dir}" sh -s -- "${ver}"
+    else
+      run_root sh -c "curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | BINDIR='${install_dir}' sh -s -- '${ver}'"
+    fi
+  else
+    curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh \
+      | BINDIR="${install_dir}" sh -s -- "${ver}"
+    export PATH="${install_dir}:${PATH}"
+    echo "⚠️  Installed to ${install_dir}." >&2
+    echo "   Ensure it's on your PATH for future shells, e.g.:" >&2
+    echo "     echo 'export PATH=\"${install_dir}:\$PATH\"' >> ~/.bashrc" >&2
   fi
 }
 
@@ -81,16 +230,58 @@ ensure_arduino_cli() {
   fi
 
   echo "⚠️  arduino-cli not found." >&2
-  if confirm "Install Arduino CLI via Homebrew now?"; then
-    brew update
-    brew install arduino-cli
-    have_cmd arduino-cli || { echo "❌ arduino-cli still not found after install." >&2; exit 1; }
-    echo "✅ arduino-cli installed." >&2
-  else
-    echo "❌ Arduino CLI is required for compile.sh." >&2
-    exit 1
+
+  if is_macos; then
+    if confirm "Install Arduino CLI via Homebrew now?"; then
+      brew update
+      brew install arduino-cli
+      have_cmd arduino-cli || { echo "❌ arduino-cli still not found after install." >&2; exit 1; }
+      echo "✅ arduino-cli installed." >&2
+    else
+      echo "❌ Arduino CLI is required for compile.sh." >&2
+      exit 1
+    fi
+    return 0
   fi
+
+  if is_linux; then
+    if confirm "Install Arduino CLI now? (package manager if available; otherwise official installer)"; then
+      local mgr
+      local installed=0
+      mgr="$(detect_pkg_mgr)"
+
+      if [[ -n "${mgr}" ]]; then
+        set +e
+        case "${mgr}" in
+          apt) run_root apt-get update -y && run_root apt-get install -y arduino-cli ;;
+          dnf) run_root dnf install -y arduino-cli ;;
+          yum) run_root yum install -y arduino-cli ;;
+          pacman) run_root pacman -Sy --noconfirm --needed arduino-cli ;;
+          zypper) run_root zypper --non-interactive install -y arduino-cli ;;
+          apk) run_root apk add arduino-cli ;;
+        esac
+        if have_cmd arduino-cli; then installed=1; fi
+        set -e
+      fi
+
+      if [[ "${installed}" -eq 0 ]]; then
+        echo "ℹ️  Package install unavailable/failed; using official installer..." >&2
+        install_arduino_cli_via_script_linux
+      fi
+
+      have_cmd arduino-cli || { echo "❌ arduino-cli still not found after install." >&2; exit 1; }
+      echo "✅ arduino-cli installed: $(arduino-cli version 2>/dev/null || command -v arduino-cli)" >&2
+      return 0
+    else
+      echo "❌ Arduino CLI is required for compile.sh." >&2
+      exit 1
+    fi
+  fi
+
+  echo "❌ Unsupported OS. Install Arduino CLI manually and re-run." >&2
+  exit 1
 }
+# ------------------------------------------------------------------
 
 ensure_esp32_core() {
   if arduino-cli core list 2>/dev/null | grep -q "^${ESP32_CORE_FQBN}[[:space:]]"; then
@@ -117,6 +308,19 @@ ensure_esp32_core() {
   else
     echo "❌ The ESP32 core is required to build the project." >&2
     exit 1
+  fi
+}
+
+init_required_libraries() {
+  if [[ ! -f "${REQUIREMENTS_FILE}" ]]; then
+    cat > "${REQUIREMENTS_FILE}" <<'EOF'
+# Libraries this firmware builds against, cloned into build/libraries by build/scripts/<platform>/setup.
+# One git repository per line, followed by git clone arguments. Pin every entry to a release tag.
+# https://github.com/bblanchon/ArduinoJson --branch v7.4.2
+EOF
+    echo "✅ Created libraries list: ${REQUIREMENTS_FILE}" >&2
+  else
+    echo "✅ Libraries list already exists: ${REQUIREMENTS_FILE}" >&2
   fi
 }
 
@@ -180,7 +384,7 @@ choose_python() {
   return 1
 }
 
-ensure_python() {
+ensure_python_linux() {
   local py=""
   if py="$(choose_python)"; then
     echo "✅ Python found: $("${py}" --version 2>&1)" >&2
@@ -189,11 +393,36 @@ ensure_python() {
   fi
 
   echo "⚠️  Python not found (python3/python)." >&2
-  if ! is_macos; then
-    echo "❌ Auto-install is only implemented for macOS. Install Python 3 and re-run." >&2
+  if confirm "Install Python 3 (and venv/pip) via system package manager now?"; then
+    local mgr
+    mgr="$(detect_pkg_mgr)"
+    case "${mgr}" in
+      apt) install_pkgs_linux python3 python3-venv python3-pip ;;
+      dnf|yum) install_pkgs_linux python3 python3-pip ;;
+      pacman) install_pkgs_linux python python-pip ;;
+      zypper) install_pkgs_linux python3 python3-pip ;;
+      apk) install_pkgs_linux python3 py3-pip py3-virtualenv ;;
+      *) install_pkgs_linux python3 ;;
+    esac
+  else
+    echo "❌ Python is required (for venv + esptool)." >&2
     exit 1
   fi
 
+  py="$(choose_python)" || { echo "❌ Python still not found after install." >&2; exit 1; }
+  echo "✅ Python installed: $("${py}" --version 2>&1)" >&2
+  printf "%s" "${py}"
+}
+
+ensure_python_macos() {
+  local py=""
+  if py="$(choose_python)"; then
+    echo "✅ Python found: $("${py}" --version 2>&1)" >&2
+    printf "%s" "${py}"
+    return 0
+  fi
+
+  echo "⚠️  Python not found (python3/python)." >&2
   if confirm "Install Python 3 via Homebrew now?"; then
     brew update
     brew install python
@@ -203,10 +432,26 @@ ensure_python() {
   fi
 
   ensure_brew_shellenv
-
   py="$(choose_python)" || { echo "❌ Python still not found after install." >&2; exit 1; }
   echo "✅ Python installed: $("${py}" --version 2>&1)" >&2
   printf "%s" "${py}"
+}
+
+ensure_python() {
+  if is_macos; then
+    ensure_python_macos
+  elif is_linux; then
+    ensure_python_linux
+  else
+    local py=""
+    if py="$(choose_python)"; then
+      echo "✅ Python found: $("${py}" --version 2>&1)" >&2
+      printf "%s" "${py}"
+      return 0
+    fi
+    echo "❌ Unsupported OS. Install Python 3 manually and re-run." >&2
+    exit 1
+  fi
 }
 
 ensure_venv() {
@@ -218,10 +463,30 @@ ensure_venv() {
   fi
 
   echo "📦 Creating venv at ${VENV_DIR}" >&2
-  "${py}" -m venv "${VENV_DIR}"
+  "${py}" -m venv "${VENV_DIR}" 2>/dev/null || {
+    echo "❌ venv creation failed." >&2
+    if is_linux; then
+      echo "   On Debian/Ubuntu, install: python3-venv" >&2
+    fi
+    exit 1
+  }
   [[ -x "${VENV_DIR}/bin/python" ]] || { echo "❌ venv creation failed." >&2; exit 1; }
 
-  "${VENV_DIR}/bin/python" -m pip install --upgrade pip >/dev/null
+  # Ensure pip exists in the venv (some distros require ensurepip)
+  if ! "${VENV_DIR}/bin/python" -m pip --version >/dev/null 2>&1; then
+    "${VENV_DIR}/bin/python" -m ensurepip --upgrade >/dev/null 2>&1 || true
+  fi
+
+  "${VENV_DIR}/bin/python" -m pip install --upgrade pip >/dev/null 2>&1 || {
+    echo "❌ pip is not available in the venv." >&2
+    if is_linux; then
+      echo "   Install pip/venv packages and re-run. Examples:" >&2
+      echo "   - Debian/Ubuntu: sudo apt-get install -y python3-venv python3-pip" >&2
+      echo "   - Fedora:        sudo dnf install -y python3-pip" >&2
+    fi
+    exit 1
+  }
+
   echo "✅ venv ready." >&2
 }
 
@@ -258,7 +523,10 @@ EOF
 init_release_matrix() {
   if [[ ! -f "${RELEASE_MATRIX_FILE}" ]]; then
     cat > "${RELEASE_MATRIX_FILE}" <<EOF
-CHIP,LED_PIN_CLOCK,LED_PIN_DATA,_BUILD_NOTES
+CHIP,_BUILD_NOTES
+c3,
+c6,
+s3,
 EOF
     echo "✅ Created release matrix: ${RELEASE_MATRIX_FILE}" >&2
   else
@@ -341,14 +609,18 @@ EOF
   echo "✅ Config header ready: ${config_file}" >&2
 }
 
-generate_gitignore() {
+ensure_gitignore() {
   local gitignore_file="${BUILD_ROOT}/.gitignore"
+  # installed toolchain and generated state; .gitignore, release_matrix.csv,
+  # required_libraries.txt and version_state are committed
   local required_lines=(
+    "scripts/"
+    "tools/"
     ".venv/"
     "builds/"
     "libraries/"
     "build_config"
-    "version_state"
+    "build_config.ps1"
   )
 
   touch "${gitignore_file}"
@@ -367,7 +639,7 @@ write_build_config() {
   local arduino_cli_path
   local brew_path
   local git_path
-  local venv_python
+  local venv_python_bin
   local venv_pip
   local project_root
   local project_name
@@ -386,7 +658,7 @@ write_build_config() {
   config_file="${project_root}/Config.h"
 
   cat > "${BUILD_CONFIG_FILE}" <<EOF
-# Auto-generated by setup_build_environment.sh
+# Auto-generated by setup.sh
 # Source this file from compile/upload scripts:
 #   source "${BUILD_CONFIG_FILE}"
 
@@ -415,6 +687,8 @@ release_matrix_file="${RELEASE_MATRIX_FILE}"
 arduino_cli="${arduino_cli_path}"
 brew_bin="${brew_path}"
 git_bin="${git_path}"
+
+python_cmd="${py_bin}"
 
 esp32_core_fqbn="${ESP32_CORE_FQBN}"
 esp32_board_manager_url="${ESP32_BOARD_MANAGER_URL}"
@@ -446,9 +720,20 @@ EOF
 }
 
 main() {
-  ensure_brew
+  ensure_local_bin_on_path
+
+  if is_macos; then
+    ensure_brew
+  elif is_linux; then
+    ensure_base_tools_linux
+  else
+    echo "❌ Unsupported OS. This script supports macOS and Linux." >&2
+    exit 1
+  fi
+
   ensure_arduino_cli
   ensure_esp32_core
+  init_required_libraries
   ensure_libraries
 
   local PY_BIN
@@ -461,6 +746,7 @@ main() {
   init_release_matrix
   ensure_project_ino
   ensure_project_config_h
+  ensure_gitignore
   write_build_config "${PY_BIN}"
 
   echo >&2
@@ -471,7 +757,7 @@ main() {
   echo "   - libraries:   ${LIBRARIES_DIR}" >&2
   echo "   - config:      ${BUILD_CONFIG_FILE}" >&2
   echo >&2
-  echo "Next: source ${BUILD_CONFIG_FILE} from your build/ scripts." >&2
+  echo "Next: source ${BUILD_CONFIG_FILE} from your build/upload scripts." >&2
 }
 
 main "$@"
