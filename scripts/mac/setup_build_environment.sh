@@ -7,7 +7,7 @@ set -euo pipefail
 # - Checks ESP32 Core; offers to install if missing
 # - Checks Python; offers to install (macOS via brew) if missing
 # - Creates .venv next to this script
-# - Checks esptool; offers to install into .venv if missing
+# - Installs esptool into .venv if missing
 # - Clones Arduino libraries from required_libraries.txt into libraries
 # - Creates build_config for reuse by build/upload scripts
 
@@ -231,18 +231,13 @@ ensure_esptool() {
     return 0
   fi
 
-  echo "⚠️  esptool not found in .venv (required for merge/upload fallback)." >&2
-  if confirm "Install esptool into .venv now?"; then
-    "${VENV_DIR}/bin/python" -m pip install --upgrade esptool
-    "${VENV_DIR}/bin/python" -c "import esptool" >/dev/null 2>&1 || {
-      echo "❌ esptool install failed." >&2
-      exit 1
-    }
-    echo "✅ esptool installed in .venv" >&2
-  else
-    echo "❌ esptool is required for compile.sh merge fallback and upload.sh when no merged bin exists." >&2
+  echo "➜ esptool not found in .venv; installing it (required for merge/upload fallback)." >&2
+  "${VENV_DIR}/bin/python" -m pip install --upgrade esptool
+  "${VENV_DIR}/bin/python" -c "import esptool" >/dev/null 2>&1 || {
+    echo "❌ esptool install failed." >&2
     exit 1
-  fi
+  }
+  echo "✅ esptool installed in .venv" >&2
 }
 
 init_state_file() {

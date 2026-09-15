@@ -15,7 +15,7 @@ $ErrorActionPreference = 'Continue'
 # - Checks ESP32 core; offers to install if missing
 # - Checks Python; offers to install via winget if missing
 # - Creates .venv under build/
-# - Checks esptool; offers to install into .venv if missing
+# - Installs esptool into .venv if missing
 # - Clones Arduino libraries from required_libraries.txt into build/libraries
 # - Creates build_config.ps1 for reuse by build/upload scripts
 
@@ -204,15 +204,11 @@ function Ensure-Esptool {
   & $VenvPython -c 'import esptool' 2>$null
   if ($LASTEXITCODE -eq 0) { Write-Ok 'esptool is present in .venv'; return }
 
-  Write-Warn 'esptool not found in .venv (required for upload).'
-  if (Confirm-Action 'Install esptool into .venv now?') {
-    & $VenvPython -m pip install --upgrade esptool
-    & $VenvPython -c 'import esptool' 2>$null
-    if ($LASTEXITCODE -ne 0) { Write-Err 'esptool install failed.'; exit 1 }
-    Write-Ok 'esptool installed in .venv'
-  } else {
-    Write-Err 'esptool is required for upload.ps1.'; exit 1
-  }
+  Write-Info 'esptool not found in .venv; installing it (required for upload).'
+  & $VenvPython -m pip install --upgrade esptool
+  & $VenvPython -c 'import esptool' 2>$null
+  if ($LASTEXITCODE -ne 0) { Write-Err 'esptool install failed.'; exit 1 }
+  Write-Ok 'esptool installed in .venv'
 }
 
 function Init-StateFile {
